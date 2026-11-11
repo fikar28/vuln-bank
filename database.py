@@ -1,4 +1,5 @@
 import os
+import secrets
 import psycopg2
 from psycopg2 import pool
 from datetime import datetime
@@ -211,30 +212,52 @@ def init_db():
                 )
             ''')
 
-            seeded_merchants = [
-                ('graphQL bookstore', 'bookstore@vulnbank.org', 'bookstore123', 'vk_fe675fe7aaee830b6fed09b64e034f84dcbdaeb429d9cccd4ebb90e15af8dd71', True),
-                ('PwnShop', 'pwnshop@vulnbank.org', 'pwnshop123', 'vk_b281bc2c616cb3c3a097215fdc9397ae87e6e06b156cc34e656be7a1a9ce8839', True),
-                ('ZeroHealth', 'zerohealth@vulnbank.org', 'zerohealth123', 'vk_8c9a013ab70c0434313e3e881c310b9ff24aff1075255ceede3f2c239c231623', True)
-            ]
-            for merchant in seeded_merchants:
-                cursor.execute("SELECT id FROM merchants WHERE email = %s", (merchant[1],))
-                if cursor.fetchone():
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS security_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute(
+                "SELECT 1 FROM security_migrations WHERE name = %s",
+                ('retire_seeded_accounts_v1',)
+            )
+            if not cursor.fetchone():
+                # Retire demo merchant accounts created by older versions. Their
+                # known credentials and API keys are discarded, and the accounts
+                # stay inactive so initialization never restores demo access.
+                retired_merchant_emails = (
+                    'bookstore@vulnbank.org',
+                    'pwnshop@vulnbank.org',
+                    'zerohealth@vulnbank.org',
+                )
+                for email in retired_merchant_emails:
                     cursor.execute(
                         """
                         UPDATE merchants
-                        SET name = %s, password = %s, api_key = %s, is_active = %s
+                        SET password = %s, api_key = %s, is_active = FALSE
                         WHERE email = %s
                         """,
-                        (merchant[0], merchant[2], merchant[3], merchant[4], merchant[1])
+                        (secrets.token_urlsafe(32), secrets.token_urlsafe(32), email)
                     )
-                else:
-                    cursor.execute(
-                        """
-                        INSERT INTO merchants (name, email, password, api_key, is_active)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        merchant
-                    )
+
+                # Revoke the legacy seeded administrator without deleting its
+                # historical account data or records that reference it.
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET username = 'retired_seeded_admin_' || id::text,
+                        password = %s,
+                        is_admin = FALSE,
+                        is_suspended = TRUE
+                    WHERE username = 'admin' AND account_number = 'ADMIN001'
+                    """,
+                    (secrets.token_urlsafe(32),)
+                )
+                cursor.execute(
+                    "INSERT INTO security_migrations (name) VALUES (%s)",
+                    ('retire_seeded_accounts_v1',)
+                )
 
             try:
                 cursor.execute("ALTER TABLE virtual_cards ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'")
@@ -248,16 +271,67 @@ def init_db():
             except Exception:
                 pass
             
-            # Create default admin account if it doesn't exist
-            cursor.execute("SELECT * FROM users WHERE username='admin'")
-            if not cursor.fetchone():
-                cursor.execute(
-                    """
-                    INSERT INTO users (username, password, account_number, balance, is_admin) 
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    ('admin', 'admin123', 'ADMIN001', 1000000.0, True)
+            # An administrator can be provisioned once from deployment-managed
+            # secrets. Initialization never creates a default account. The
+            # application calls init_db before serving requests, so invalid or
+            # conflicting bootstrap configuration fails before network exposure.
+            bootstrap_username = os.getenv('VULNBANK_BOOTSTRAP_ADMIN_USERNAME')
+            bootstrap_password = os.getenv('VULNBANK_BOOTSTRAP_ADMIN_PASSWORD')
+            if bool(bootstrap_username) != bool(bootstrap_password):
+                raise ValueError(
+                    'Both VULNBANK_BOOTSTRAP_ADMIN_USERNAME and '
+                    'VULNBANK_BOOTSTRAP_ADMIN_PASSWORD must be configured together'
                 )
+
+            if bootstrap_username is not None:
+                if (not bootstrap_username.strip()
+                        or bootstrap_username != bootstrap_username.strip()
+                        or len(bootstrap_password) < 32):
+                    raise ValueError(
+                        'Bootstrap administrator username must be non-empty and '
+                        'password must contain at least 32 characters'
+                    )
+
+                cursor.execute(
+                    "SELECT id FROM users WHERE is_admin = TRUE AND is_suspended = FALSE LIMIT 1"
+                )
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "SELECT id FROM users WHERE username = %s",
+                        (bootstrap_username,)
+                    )
+                    if cursor.fetchone():
+                        raise ValueError(
+                            'Bootstrap administrator username is already assigned to another account'
+                        )
+
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM users WHERE password = %s
+                            UNION ALL
+                            SELECT 1 FROM merchants WHERE password = %s
+                        )
+                        """,
+                        (bootstrap_password, bootstrap_password)
+                    )
+                    if cursor.fetchone()[0]:
+                        raise ValueError(
+                            'Bootstrap administrator password must be unique to this account'
+                        )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO users (username, password, account_number, balance, is_admin, is_suspended)
+                        VALUES (%s, %s, %s, %s, TRUE, FALSE)
+                        """,
+                        (
+                            bootstrap_username,
+                            bootstrap_password,
+                            f'BOOT-{secrets.token_hex(16)}',
+                            0.0,
+                        )
+                    )
             
             # Create bill categories table
             cursor.execute('''
